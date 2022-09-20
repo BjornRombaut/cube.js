@@ -13,7 +13,7 @@ pub mod wal;
 
 use async_trait::async_trait;
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
-use log::info;
+use log::{error, info};
 use rocksdb::{
     ColumnFamily, ColumnFamilyDescriptor, CompactionDecision, DBIterator, Direction, IteratorMode,
     MergeOperands, Options, ReadOptions, Snapshot, WriteBatch, WriteBatchIterator, DB,
@@ -2171,11 +2171,21 @@ fn meta_store_default_cf_merge(
     Some(result)
 }
 
-struct MetaStoreCacheCompactionFilter(CString);
+struct MetaStoreCacheCompactionFilter {
+    name: CString,
+    current: DateTime<Utc>,
+    removed: u64,
+    orphaned: u64,
+}
 
 impl MetaStoreCacheCompactionFilter {
     pub fn new() -> Self {
-        Self(CString::new("cache-expire-check").unwrap())
+        Self {
+            name: CString::new("cache-expire-check").unwrap(),
+            current: chrono::offset::Utc::now(),
+            removed: 0,
+            orphaned: 0,
+        }
     }
 }
 
@@ -2186,11 +2196,39 @@ impl CompactionFilter for MetaStoreCacheCompactionFilter {
             level, key, value
         );
 
+        let real_key = String::from_utf8_lossy(&key[..]);
+        println!("real {}", real_key);
+
+        if let Ok(reader) = flexbuffers::Reader::get_root(&value) {
+            let root = reader.as_map();
+
+            println!("keys {:?}", root.keys_vector().iter().join(","));
+            if let Some(expire_key_id) = root.index_key(&"expire") {
+                let res = chrono::DateTime::parse_from_rfc3339(root.idx(expire_key_id).as_str());
+                match res {
+                    Ok(expire) => {
+                        if expire <= self.current {
+                            self.removed += 1;
+
+                            return CompactionDecision::Remove;
+                        }
+                    }
+                    Err(err) => {
+                        error!("While compaction: {}", err);
+
+                        self.orphaned += 1;
+
+                        return CompactionDecision::Remove;
+                    }
+                }
+            }
+        }
+
         CompactionDecision::Keep
     }
 
     fn name(&self) -> &CStr {
-        &self.0
+        &self.name
     }
 }
 
