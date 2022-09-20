@@ -169,7 +169,7 @@ macro_rules! rocks_table_impl {
             type T = $table;
 
             fn cf_name(&self) -> ColumnFamilyName {
-                ColumnFamilyName::Default
+                $cfn
             }
 
             fn db(&self) -> &DB {
