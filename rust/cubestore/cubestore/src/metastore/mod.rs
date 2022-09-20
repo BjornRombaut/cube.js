@@ -1862,7 +1862,7 @@ trait RocksTable: Debug + Send + Sync {
 
     fn get_row(&self, row_id: u64) -> Result<Option<IdRow<Self::T>>, CubeError> {
         let ref db = self.snapshot();
-        let res = db.get(RowKey::Table(self.table_id(), row_id).to_bytes())?;
+        let res = db.get_cf(self.cf()?, RowKey::Table(self.table_id(), row_id).to_bytes())?;
 
         if let Some(buffer) = res {
             let row = self.deserialize_id_row(row_id, buffer.as_slice())?;
