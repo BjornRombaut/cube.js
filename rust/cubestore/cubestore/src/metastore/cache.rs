@@ -91,6 +91,12 @@ impl RocksSecondaryIndex<CacheItem, CacheItemIndexKey> for CacheItemRocksIndex {
         }
     }
 
+    fn is_ttl(&self) -> bool {
+        match self {
+            CacheItemRocksIndex::Key => true,
+        }
+    }
+
     fn get_id(&self) -> IndexId {
         *self as IndexId
     }

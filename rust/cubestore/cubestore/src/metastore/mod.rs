@@ -50,7 +50,7 @@ use crate::CubeError;
 use arrow::datatypes::TimeUnit::Microsecond;
 use arrow::datatypes::{DataType, Field};
 use cache::{CacheItemRocksIndex, CacheItemRocksTable};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, NaiveDateTime, Utc};
 use chunks::ChunkRocksTable;
 use core::{fmt, mem};
 use cubehll::HllSketch;
@@ -147,6 +147,10 @@ macro_rules! base_rocks_secondary_index {
 
             fn is_unique(&self) -> bool {
                 RocksSecondaryIndex::is_unique(self)
+            }
+
+            fn is_ttl(&self) -> bool {
+                RocksSecondaryIndex::is_ttl(self)
             }
         }
     };
@@ -1193,6 +1197,7 @@ pub enum RowKey {
     Sequence(TableId),
     SecondaryIndex(IndexId, SecondaryKey, u64),
     SecondaryIndexInfo { index_id: IndexId },
+    SecondaryIndexWithTTL(IndexId, SecondaryKey, u64, Option<DateTime<Utc>>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Hash, Eq, PartialEq)]
@@ -1230,6 +1235,25 @@ impl RowKey {
 
                 RowKey::SecondaryIndexInfo { index_id }
             }
+            5 => {
+                let table_id = IndexId::from(reader.read_u32::<BigEndian>().unwrap());
+                let mut secondary_key: SecondaryKey = SecondaryKey::new();
+                let sc_length = bytes.len() - 13;
+                for _i in 0..sc_length {
+                    secondary_key.push(reader.read_u8().unwrap());
+                }
+                let row_id = reader.read_u64::<BigEndian>().unwrap();
+                let timestamp = reader.read_u64::<BigEndian>().unwrap();
+
+                let expire = if timestamp == 0 {
+                    None
+                } else {
+                    let naive = NaiveDateTime::from_timestamp(timestamp as i64, 0);
+                    Some(DateTime::from_utc(naive, Utc))
+                };
+
+                RowKey::SecondaryIndexWithTTL(table_id, secondary_key, row_id, expire)
+            }
             v => panic!("Unknown key prefix: {}", v),
         }
     }
@@ -1258,6 +1282,21 @@ impl RowKey {
             RowKey::SecondaryIndexInfo { index_id } => {
                 wtr.write_u8(4).unwrap();
                 wtr.write_u32::<BigEndian>(*index_id as IndexId).unwrap();
+            }
+            RowKey::SecondaryIndexWithTTL(index_id, secondary_key, row_id, expire) => {
+                wtr.write_u8(5).unwrap();
+                wtr.write_u32::<BigEndian>(*index_id as IndexId).unwrap();
+                for &n in secondary_key {
+                    wtr.write_u8(n).unwrap();
+                }
+                wtr.write_u64::<BigEndian>(row_id.clone()).unwrap();
+
+                if let Some(expire) = expire {
+                    wtr.write_u64::<BigEndian>(expire.timestamp() as u64)
+                        .unwrap();
+                } else {
+                    wtr.write_u64::<BigEndian>(0).unwrap();
+                }
             }
         }
         wtr
@@ -1381,6 +1420,8 @@ trait BaseRocksSecondaryIndex<T>: Debug {
 
     fn is_unique(&self) -> bool;
 
+    fn is_ttl(&self) -> bool;
+
     fn version(&self) -> u32;
 }
 
@@ -1403,6 +1444,10 @@ trait RocksSecondaryIndex<T, K: Hash>: BaseRocksSecondaryIndex<T> {
     fn is_unique(&self) -> bool;
 
     fn version(&self) -> u32;
+
+    fn is_ttl(&self) -> bool {
+        false
+    }
 }
 
 impl<T, I> BaseRocksSecondaryIndex<T> for I
@@ -1419,6 +1464,10 @@ where
 
     fn is_unique(&self) -> bool {
         RocksSecondaryIndex::is_unique(self)
+    }
+
+    fn is_ttl(&self) -> bool {
+        RocksSecondaryIndex::is_ttl(self)
     }
 
     fn version(&self) -> u32 {
@@ -1561,6 +1610,7 @@ trait RocksTable: Debug + Send + Sync {
             {
                 return Err(CubeError::internal(format!("Primary key constraint violation in secondary index. Primary key already exists for a row id {}: {:?}", row_id, &row)));
             }
+            println!("put index {:?} {:?}", to_insert.key, to_insert.val);
             batch_pipe
                 .batch()
                 .put_cf(self.cf()?, to_insert.key, to_insert.val);
@@ -1627,8 +1677,11 @@ trait RocksTable: Debug + Send + Sync {
             }
             let row = row?;
             let index_row = self.index_key_val(row.get_row(), row.get_id(), index);
+            println!("put index {:?} {:?}", index_row.key, index_row.val);
+
             batch.put(index_row.key, index_row.val);
         }
+
         batch.put_cf(
             self.cf()?,
             &RowKey::SecondaryIndexInfo {
@@ -1641,6 +1694,7 @@ trait RocksTable: Debug + Send + Sync {
             .as_slice(),
         );
         self.db().write(batch)?;
+
         if log_shown {
             log::info!(
                 "Rebuilding metastore index {:?} for table {:?} complete ({:?})",
@@ -1649,6 +1703,7 @@ trait RocksTable: Debug + Send + Sync {
                 time.elapsed()?
             );
         }
+
         Ok(())
     }
 
@@ -1691,7 +1746,9 @@ trait RocksTable: Debug + Send + Sync {
                     .into_iter()
                     .find(|i| i.get_id() == BaseRocksSecondaryIndex::get_id(secondary_index))
                     .unwrap();
+
                 self.rebuild_index(&index)?;
+
                 return Err(CubeError::internal(format!(
                     "Row exists in secondary index however missing in {:?} table: {}. Repairing index.",
                     self, id
@@ -1889,6 +1946,11 @@ trait RocksTable: Debug + Send + Sync {
         Ok(res)
     }
 
+    fn get_expire_from_row(&self, row: &Self::T) -> Option<DateTime<Utc>> {
+        println!("row {:?}", row);
+        None
+    }
+
     fn index_key_val(
         &self,
         row: &Self::T,
@@ -1897,11 +1959,22 @@ trait RocksTable: Debug + Send + Sync {
     ) -> KeyVal {
         let hash = index.key_hash(row);
         let index_val = index.index_key_by(row);
-        let key = RowKey::SecondaryIndex(
-            self.index_id(index.get_id()),
-            hash.to_be_bytes().to_vec(),
-            row_id,
-        );
+
+        let key = if index.is_ttl() {
+            RowKey::SecondaryIndexWithTTL(
+                self.index_id(index.get_id()),
+                hash.to_be_bytes().to_vec(),
+                row_id,
+                self.get_expire_from_row(row),
+            )
+        } else {
+            RowKey::SecondaryIndex(
+                self.index_id(index.get_id()),
+                hash.to_be_bytes().to_vec(),
+                row_id,
+            )
+        };
+
         KeyVal {
             key: key.to_bytes(),
             val: index_val,
@@ -2196,32 +2269,32 @@ impl CompactionFilter for MetaStoreCacheCompactionFilter {
             level, key, value
         );
 
-        let real_key = String::from_utf8_lossy(&key[..]);
-
-        if let Ok(reader) = flexbuffers::Reader::get_root(&value) {
-            let root = reader.as_map();
-
-            println!("keys {:?}", root.keys_vector().iter().join(","));
-            if let Some(expire_key_id) = root.index_key(&"expire") {
-                let res = chrono::DateTime::parse_from_rfc3339(root.idx(expire_key_id).as_str());
-                match res {
-                    Ok(expire) => {
-                        if expire <= self.current {
-                            self.removed += 1;
-
-                            return CompactionDecision::Remove;
-                        }
-                    }
-                    Err(err) => {
-                        error!("While compaction: {}", err);
-
-                        self.orphaned += 1;
-
-                        return CompactionDecision::Remove;
-                    }
-                }
-            }
-        }
+        // let real_key = String::from_utf8_lossy(&key[..]);
+        //
+        // if let Ok(reader) = flexbuffers::Reader::get_root(&value) {
+        //     let root = reader.as_map();
+        //
+        //     println!("keys {:?}", root.keys_vector().iter().join(","));
+        //     if let Some(expire_key_id) = root.index_key(&"expire") {
+        //         let res = chrono::DateTime::parse_from_rfc3339(root.idx(expire_key_id).as_str());
+        //         match res {
+        //             Ok(expire) => {
+        //                 if expire <= self.current {
+        //                     self.removed += 1;
+        //
+        //                     return CompactionDecision::Remove;
+        //                 }
+        //             }
+        //             Err(err) => {
+        //                 error!("While compaction: {}", err);
+        //
+        //                 self.orphaned += 1;
+        //
+        //                 return CompactionDecision::Remove;
+        //             }
+        //         }
+        //     }
+        // }
 
         CompactionDecision::Keep
     }
