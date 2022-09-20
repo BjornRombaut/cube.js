@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use log::info;
 use rocksdb::{
-    ColumnFamily, ColumnFamilyDescriptor, CompactionDecision, DBCompactionStyle, DBIterator,
+    ColumnFamily, ColumnFamilyDescriptor, CompactionDecision, DBIterator,
     Direction, IteratorMode, MergeOperands, Options, ReadOptions, Snapshot, WriteBatch,
     WriteBatchIterator, DB, DEFAULT_COLUMN_FAMILY_NAME,
 };
@@ -68,10 +68,13 @@ use partition::{PartitionRocksIndex, PartitionRocksTable};
 use regex::Regex;
 use rocksdb::backup::BackupEngineOptions;
 use rocksdb::checkpoint::Checkpoint;
+use rocksdb::compaction_filter::CompactionFilter;
+use rocksdb::compaction_filter_factory::{CompactionFilterContext, CompactionFilterFactory};
 use schema::{SchemaRocksIndex, SchemaRocksTable};
 use smallvec::alloc::fmt::Formatter;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
+use std::ffi::{CStr, CString};
 use std::fmt::{Debug, Display};
 use std::mem::take;
 use std::path::{Path, PathBuf};
@@ -82,7 +85,7 @@ use table::Table;
 use table::{TableRocksIndex, TableRocksTable};
 use tokio::fs::File;
 use tokio::sync::broadcast::Sender;
-use tracing_futures::WithSubscriber;
+
 use wal::WALRocksTable;
 
 #[macro_export]
@@ -2165,13 +2168,47 @@ fn meta_store_default_cf_merge(
     Some(result)
 }
 
-fn meta_store_cache_cf_compaction(level: u32, key: &[u8], value: &[u8]) -> CompactionDecision {
-    println!(
-        "meta_store_cache_cf_compaction level {} key {:?} value {:?}",
-        level, key, value
-    );
+struct MetaStoreCacheCompactionFilter(CString);
 
-    CompactionDecision::Keep
+impl MetaStoreCacheCompactionFilter {
+    pub fn new() -> Self {
+        Self(CString::new("cache-expire-check").unwrap())
+    }
+}
+
+impl CompactionFilter for MetaStoreCacheCompactionFilter {
+    fn filter(&mut self, level: u32, key: &[u8], value: &[u8]) -> CompactionDecision {
+        println!(
+            "meta_store_cache_cf_compaction level {} key {:?} value {:?}",
+            level, key, value
+        );
+
+        CompactionDecision::Keep
+    }
+
+    fn name(&self) -> &CStr {
+        &self.0
+    }
+}
+
+struct MetaStoreCacheCompactionFactory(CString);
+
+impl MetaStoreCacheCompactionFactory {
+    pub fn new() -> Self {
+        Self(CString::new("cache-expire-check").unwrap())
+    }
+}
+
+impl CompactionFilterFactory for MetaStoreCacheCompactionFactory {
+    type Filter = MetaStoreCacheCompactionFilter;
+
+    fn create(&mut self, _: CompactionFilterContext) -> Self::Filter {
+        MetaStoreCacheCompactionFilter::new()
+    }
+
+    fn name(&self) -> &CStr {
+        &self.0
+    }
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize, Eq, PartialEq, Debug)]
@@ -2235,7 +2272,7 @@ impl RocksMetaStore {
             opts.create_if_missing(true);
             opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(13));
             opts.set_merge_operator_associative("meta_store merge", meta_store_default_cf_merge);
-            opts.set_compaction_filter("expire-check", meta_store_cache_cf_compaction);
+            opts.set_compaction_filter_factory(MetaStoreCacheCompactionFactory::new());
             opts.enable_statistics();
 
             ColumnFamilyDescriptor::new(ColumnFamilyName::Cache, opts)
@@ -2248,6 +2285,12 @@ impl RocksMetaStore {
         opts.set_merge_operator_associative("meta_store merge", meta_store_default_cf_merge);
 
         let db = DB::open_cf_descriptors(&opts, path, vec![default_cf, cache_cf]).unwrap();
+        db.set_options_cf(
+            db.cf_handle(ColumnFamilyName::Cache.into()).unwrap(),
+            &[("periodic_compaction_seconds", "60")],
+        )
+        .unwrap();
+
         let db_arc = Arc::new(db);
 
         let (default_rw_loop_tx, default_rw_loop_rx) = std::sync::mpsc::sync_channel::<

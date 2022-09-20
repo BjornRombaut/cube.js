@@ -3,16 +3,16 @@ use super::{
 };
 use crate::metastore::{ColumnFamilyName, IdRow, MetaStoreEvent};
 use crate::rocks_table_impl;
-use crate::table::Row;
-use crate::{base_rocks_secondary_index, CubeError};
-use byteorder::{BigEndian, WriteBytesExt};
+
+use crate::{base_rocks_secondary_index};
+
 use chrono::{DateTime, Duration, Utc};
-use rand::distributions::Alphanumeric;
-use rand::{thread_rng, Rng};
+
+
 use rocksdb::DB;
 use serde::{Deserialize, Deserializer};
 use std::ops::Add;
-use std::time::SystemTime;
+
 
 impl CacheItem {
     pub fn new(key: String, ttl: Option<u32>, value: String) -> CacheItem {

@@ -1,9 +1,9 @@
-use crate::metastore::table::TablePath;
+
 use crate::metastore::{ColumnFamilyName, MetaStore};
 use crate::queryplanner::InfoSchemaTableDef;
 use crate::CubeError;
-use arrow::array::{ArrayRef, BooleanArray, StringArray, TimestampNanosecondArray, UInt64Array};
-use arrow::datatypes::{DataType, Field, TimeUnit};
+use arrow::array::{ArrayRef, StringArray};
+use arrow::datatypes::{DataType, Field};
 use async_trait::async_trait;
 use std::sync::Arc;
 
