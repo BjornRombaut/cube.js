@@ -1,4 +1,3 @@
-
 use crate::metastore::{ColumnFamilyName, MetaStore};
 use crate::queryplanner::InfoSchemaTableDef;
 use crate::CubeError;

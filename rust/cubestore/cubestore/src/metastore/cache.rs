@@ -4,15 +4,13 @@ use super::{
 use crate::metastore::{ColumnFamilyName, IdRow, MetaStoreEvent};
 use crate::rocks_table_impl;
 
-use crate::{base_rocks_secondary_index};
+use crate::base_rocks_secondary_index;
 
 use chrono::{DateTime, Duration, Utc};
-
 
 use rocksdb::DB;
 use serde::{Deserialize, Deserializer};
 use std::ops::Add;
-
 
 impl CacheItem {
     pub fn new(key: String, ttl: Option<u32>, value: String) -> CacheItem {

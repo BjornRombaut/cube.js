@@ -15,9 +15,9 @@ use async_trait::async_trait;
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use log::info;
 use rocksdb::{
-    ColumnFamily, ColumnFamilyDescriptor, CompactionDecision, DBIterator,
-    Direction, IteratorMode, MergeOperands, Options, ReadOptions, Snapshot, WriteBatch,
-    WriteBatchIterator, DB, DEFAULT_COLUMN_FAMILY_NAME,
+    ColumnFamily, ColumnFamilyDescriptor, CompactionDecision, DBIterator, Direction, IteratorMode,
+    MergeOperands, Options, ReadOptions, Snapshot, WriteBatch, WriteBatchIterator, DB,
+    DEFAULT_COLUMN_FAMILY_NAME,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use std::hash::{Hash, Hasher};
@@ -1862,7 +1862,10 @@ trait RocksTable: Debug + Send + Sync {
 
     fn get_row(&self, row_id: u64) -> Result<Option<IdRow<Self::T>>, CubeError> {
         let ref db = self.snapshot();
-        let res = db.get_cf(self.cf()?, RowKey::Table(self.table_id(), row_id).to_bytes())?;
+        let res = db.get_cf(
+            self.cf()?,
+            RowKey::Table(self.table_id(), row_id).to_bytes(),
+        )?;
 
         if let Some(buffer) = res {
             let row = self.deserialize_id_row(row_id, buffer.as_slice())?;
@@ -3702,7 +3705,7 @@ impl MetaStore for RocksMetaStore {
     }
 
     async fn cache_get(&self, key: String) -> Result<Option<IdRow<CacheItem>>, CubeError> {
-        self.read_operation(move |db_ref| {
+        self.read_operation_cache(move |db_ref| {
             let cache_schema = CacheItemRocksTable::new(db_ref.clone());
             let index_key = CacheItemIndexKey::ByKey(key);
             let id_row_opt =
