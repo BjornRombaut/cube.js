@@ -2197,7 +2197,6 @@ impl CompactionFilter for MetaStoreCacheCompactionFilter {
         );
 
         let real_key = String::from_utf8_lossy(&key[..]);
-        println!("real {}", real_key);
 
         if let Ok(reader) = flexbuffers::Reader::get_root(&value) {
             let root = reader.as_map();
