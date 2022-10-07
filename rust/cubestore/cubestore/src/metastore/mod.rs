@@ -1,5 +1,6 @@
 pub mod cache;
 pub mod chunks;
+pub mod compaction;
 pub mod index;
 pub mod job;
 pub mod listener;
@@ -1193,11 +1194,10 @@ type IndexId = u32;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Hash, Eq, PartialEq)]
 pub enum RowKey {
-    Table(TableId, u64),
+    Table(TableId, /** row_id */ u64),
     Sequence(TableId),
-    SecondaryIndex(IndexId, SecondaryKey, u64),
+    SecondaryIndex(IndexId, SecondaryKey, /** row_id */ u64),
     SecondaryIndexInfo { index_id: IndexId },
-    SecondaryIndexWithTTL(IndexId, SecondaryKey, u64, Option<DateTime<Utc>>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Hash, Eq, PartialEq)]
@@ -1210,52 +1210,45 @@ pub fn get_fixed_prefix() -> usize {
 }
 
 impl RowKey {
-    fn from_bytes(bytes: &[u8]) -> RowKey {
+    fn try_from_bytes(bytes: &[u8]) -> Result<RowKey, CubeError> {
         let mut reader = Cursor::new(bytes);
-        match reader.read_u8().unwrap() {
-            1 => RowKey::Table(TableId::from(reader.read_u32::<BigEndian>().unwrap()), {
-                // skip zero for fixed key padding
-                reader.read_u64::<BigEndian>().unwrap();
-                reader.read_u64::<BigEndian>().unwrap()
-            }),
-            2 => RowKey::Sequence(TableId::from(reader.read_u32::<BigEndian>().unwrap())),
+        match reader.read_u8()? {
+            1 => Ok(RowKey::Table(
+                TableId::from(reader.read_u32::<BigEndian>()?),
+                {
+                    // skip zero for fixed key padding
+                    reader.read_u64::<BigEndian>()?;
+                    reader.read_u64::<BigEndian>()?
+                },
+            )),
+            2 => Ok(RowKey::Sequence(TableId::from(
+                reader.read_u32::<BigEndian>()?,
+            ))),
             3 => {
-                let table_id = IndexId::from(reader.read_u32::<BigEndian>().unwrap());
+                let table_id = IndexId::from(reader.read_u32::<BigEndian>()?);
                 let mut secondary_key: SecondaryKey = SecondaryKey::new();
                 let sc_length = bytes.len() - 13;
                 for _i in 0..sc_length {
-                    secondary_key.push(reader.read_u8().unwrap());
+                    secondary_key.push(reader.read_u8()?);
                 }
-                let row_id = reader.read_u64::<BigEndian>().unwrap();
+                let row_id = reader.read_u64::<BigEndian>()?;
 
-                RowKey::SecondaryIndex(table_id, secondary_key, row_id)
+                Ok(RowKey::SecondaryIndex(table_id, secondary_key, row_id))
             }
             4 => {
-                let index_id = IndexId::from(reader.read_u32::<BigEndian>().unwrap());
+                let index_id = IndexId::from(reader.read_u32::<BigEndian>()?);
 
-                RowKey::SecondaryIndexInfo { index_id }
+                Ok(RowKey::SecondaryIndexInfo { index_id })
             }
-            5 => {
-                let table_id = IndexId::from(reader.read_u32::<BigEndian>().unwrap());
-                let mut secondary_key: SecondaryKey = SecondaryKey::new();
-                let sc_length = bytes.len() - 13;
-                for _i in 0..sc_length {
-                    secondary_key.push(reader.read_u8().unwrap());
-                }
-                let row_id = reader.read_u64::<BigEndian>().unwrap();
-                let timestamp = reader.read_u64::<BigEndian>().unwrap();
-
-                let expire = if timestamp == 0 {
-                    None
-                } else {
-                    let naive = NaiveDateTime::from_timestamp(timestamp as i64, 0);
-                    Some(DateTime::from_utc(naive, Utc))
-                };
-
-                RowKey::SecondaryIndexWithTTL(table_id, secondary_key, row_id, expire)
-            }
-            v => panic!("Unknown key prefix: {}", v),
+            v => Err(CubeError::internal(format!(
+                "Unable to read RowKey with key prefix: {}",
+                v
+            ))),
         }
+    }
+
+    fn from_bytes(bytes: &[u8]) -> RowKey {
+        RowKey::try_from_bytes(bytes).unwrap()
     }
 
     fn to_bytes(&self) -> Vec<u8> {
@@ -1282,21 +1275,6 @@ impl RowKey {
             RowKey::SecondaryIndexInfo { index_id } => {
                 wtr.write_u8(4).unwrap();
                 wtr.write_u32::<BigEndian>(*index_id as IndexId).unwrap();
-            }
-            RowKey::SecondaryIndexWithTTL(index_id, secondary_key, row_id, expire) => {
-                wtr.write_u8(5).unwrap();
-                wtr.write_u32::<BigEndian>(*index_id as IndexId).unwrap();
-                for &n in secondary_key {
-                    wtr.write_u8(n).unwrap();
-                }
-                wtr.write_u64::<BigEndian>(row_id.clone()).unwrap();
-
-                if let Some(expire) = expire {
-                    wtr.write_u64::<BigEndian>(expire.timestamp() as u64)
-                        .unwrap();
-                } else {
-                    wtr.write_u64::<BigEndian>(0).unwrap();
-                }
             }
         }
         wtr
@@ -1346,6 +1324,24 @@ enum_from_primitive! {
         MultiIndexes = 0x0900,
         MultiPartitions = 0x0A00,
         CacheItems = 0x0B00
+    }
+}
+
+impl TableId {
+    pub fn has_ttl(&self) -> bool {
+        match self {
+            TableId::Schemas => false,
+            TableId::Tables => false,
+            TableId::Indexes => false,
+            TableId::Partitions => false,
+            TableId::Chunks => false,
+            TableId::WALs => false,
+            TableId::Jobs => false,
+            TableId::Sources => false,
+            TableId::MultiIndexes => false,
+            TableId::MultiPartitions => false,
+            TableId::CacheItems => true,
+        }
     }
 }
 
@@ -1946,11 +1942,6 @@ trait RocksTable: Debug + Send + Sync {
         Ok(res)
     }
 
-    fn get_expire_from_row(&self, row: &Self::T) -> Option<DateTime<Utc>> {
-        println!("row {:?}", row);
-        None
-    }
-
     fn index_key_val(
         &self,
         row: &Self::T,
@@ -1960,20 +1951,11 @@ trait RocksTable: Debug + Send + Sync {
         let hash = index.key_hash(row);
         let index_val = index.index_key_by(row);
 
-        let key = if index.is_ttl() {
-            RowKey::SecondaryIndexWithTTL(
-                self.index_id(index.get_id()),
-                hash.to_be_bytes().to_vec(),
-                row_id,
-                self.get_expire_from_row(row),
-            )
-        } else {
-            RowKey::SecondaryIndex(
-                self.index_id(index.get_id()),
-                hash.to_be_bytes().to_vec(),
-                row_id,
-            )
-        };
+        let key = RowKey::SecondaryIndex(
+            self.index_id(index.get_id()),
+            hash.to_be_bytes().to_vec(),
+            row_id,
+        );
 
         KeyVal {
             key: key.to_bytes(),
@@ -2244,86 +2226,6 @@ fn meta_store_default_cf_merge(
     Some(result)
 }
 
-struct MetaStoreCacheCompactionFilter {
-    name: CString,
-    current: DateTime<Utc>,
-    removed: u64,
-    orphaned: u64,
-}
-
-impl MetaStoreCacheCompactionFilter {
-    pub fn new() -> Self {
-        Self {
-            name: CString::new("cache-expire-check").unwrap(),
-            current: chrono::offset::Utc::now(),
-            removed: 0,
-            orphaned: 0,
-        }
-    }
-}
-
-impl CompactionFilter for MetaStoreCacheCompactionFilter {
-    fn filter(&mut self, level: u32, key: &[u8], value: &[u8]) -> CompactionDecision {
-        println!(
-            "meta_store_cache_cf_compaction level {} key {:?} value {:?}",
-            level, key, value
-        );
-
-        // let real_key = String::from_utf8_lossy(&key[..]);
-        //
-        // if let Ok(reader) = flexbuffers::Reader::get_root(&value) {
-        //     let root = reader.as_map();
-        //
-        //     println!("keys {:?}", root.keys_vector().iter().join(","));
-        //     if let Some(expire_key_id) = root.index_key(&"expire") {
-        //         let res = chrono::DateTime::parse_from_rfc3339(root.idx(expire_key_id).as_str());
-        //         match res {
-        //             Ok(expire) => {
-        //                 if expire <= self.current {
-        //                     self.removed += 1;
-        //
-        //                     return CompactionDecision::Remove;
-        //                 }
-        //             }
-        //             Err(err) => {
-        //                 error!("While compaction: {}", err);
-        //
-        //                 self.orphaned += 1;
-        //
-        //                 return CompactionDecision::Remove;
-        //             }
-        //         }
-        //     }
-        // }
-
-        CompactionDecision::Keep
-    }
-
-    fn name(&self) -> &CStr {
-        &self.name
-    }
-}
-
-struct MetaStoreCacheCompactionFactory(CString);
-
-impl MetaStoreCacheCompactionFactory {
-    pub fn new() -> Self {
-        Self(CString::new("cache-expire-check").unwrap())
-    }
-}
-
-impl CompactionFilterFactory for MetaStoreCacheCompactionFactory {
-    type Filter = MetaStoreCacheCompactionFilter;
-
-    fn create(&mut self, _: CompactionFilterContext) -> Self::Filter {
-        MetaStoreCacheCompactionFilter::new()
-    }
-
-    fn name(&self) -> &CStr {
-        &self.0
-    }
-}
-
 #[derive(Clone, Copy, Serialize, Deserialize, Eq, PartialEq, Debug)]
 pub enum ColumnFamilyName {
     Default,
@@ -2385,7 +2287,7 @@ impl RocksMetaStore {
             opts.create_if_missing(true);
             opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(13));
             opts.set_merge_operator_associative("meta_store merge", meta_store_default_cf_merge);
-            opts.set_compaction_filter_factory(MetaStoreCacheCompactionFactory::new());
+            opts.set_compaction_filter_factory(compaction::MetaStoreCacheCompactionFactory::new());
             opts.enable_statistics();
 
             ColumnFamilyDescriptor::new(ColumnFamilyName::Cache, opts)
