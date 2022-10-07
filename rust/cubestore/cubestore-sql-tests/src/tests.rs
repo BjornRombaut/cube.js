@@ -23,6 +23,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncWriteExt, BufWriter};
+use tokio::time::sleep;
 
 pub type TestFn = Box<
     dyn Fn(Box<dyn SqlClient>) -> Pin<Box<dyn Future<Output = ()> + Send>>
@@ -205,6 +206,7 @@ pub fn sql_tests() -> Vec<(&'static str, TestFn)> {
         t("inline_tables", inline_tables),
         t("inline_tables_2x", inline_tables_2x),
         t("build_range_end", build_range_end),
+        t("cache_set_nx", cache_set_nx),
     ];
 
     fn t<F>(name: &'static str, f: fn(Box<dyn SqlClient>) -> F) -> (&'static str, TestFn)
@@ -5923,6 +5925,63 @@ async fn build_range_end(service: Box<dyn SqlClient>) {
                 TableValue::String("s".to_string()),
                 TableValue::String("t1".to_string()),
                 TableValue::Timestamp(timestamp_from_string("2020-01-01T00:00:00.000").unwrap()),
+            ]),
+        ]
+    );
+}
+
+async fn cache_set_nx(service: Box<dyn SqlClient>) {
+    let set_nx_key_sql = "CACHE SET NX TTL 5 'mykey' 'myvalue';";
+
+    let set_response = service
+        .exec_query(set_nx_key_sql)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        set_response.get_columns(),
+        &vec![
+            Column::new("success".to_string(), ColumnType::Boolean, 0),
+        ]
+    );
+
+    assert_eq!(
+        set_response.get_rows(),
+        &vec![
+            Row::new(vec![
+                TableValue::Boolean(true),
+            ]),
+        ]
+    );
+
+    // key was already defined
+    let set_response = service
+        .exec_query(set_nx_key_sql)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        set_response.get_rows(),
+        &vec![
+            Row::new(vec![
+                TableValue::Boolean(false),
+            ]),
+        ]
+    );
+
+    sleep(Duration::new(5, 0)).await;
+
+    // key was expired
+    let set_response = service
+        .exec_query(set_nx_key_sql)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        set_response.get_rows(),
+        &vec![
+            Row::new(vec![
+                TableValue::Boolean(true),
             ]),
         ]
     );

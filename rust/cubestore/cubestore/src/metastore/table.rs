@@ -312,35 +312,6 @@ impl Table {
     }
 }
 
-impl Column {
-    pub fn new(name: String, column_type: ColumnType, column_index: usize) -> Column {
-        Column {
-            name,
-            column_type,
-            column_index,
-        }
-    }
-    pub fn get_name(&self) -> &String {
-        &self.name
-    }
-
-    pub fn get_column_type(&self) -> &ColumnType {
-        &self.column_type
-    }
-
-    pub fn get_index(&self) -> usize {
-        self.column_index
-    }
-
-    pub fn replace_index(&self, column_index: usize) -> Column {
-        Column {
-            name: self.name.clone(),
-            column_type: self.column_type.clone(),
-            column_index,
-        }
-    }
-}
-
 rocks_table_impl!(
     Table,
     TableRocksTable,
